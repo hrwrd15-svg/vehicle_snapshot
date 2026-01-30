@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - uses: actions/checkout@v4
 
@@ -18,42 +19,105 @@ jobs:
           set -euo pipefail
           URL="https://vehicle-api-espm.onrender.com/cars?per_page=25000&page=1&_t=${{ github.run_id }}"
           echo "Downloading: $URL"
-          rm -f cars.json
-          curl -fsSLo cars.json -H 'Cache-Control: no-cache' --retry 4 --retry-delay 4 "$URL"
+          rm -f cars_raw.json cars.json
 
-          # Basic sanity: must look like JSON and contain at least one known key
-          if ! head -c 1 cars.json | grep -q '^\[' && ! head -c 1 cars.json | grep -q '^{'; then
-            echo "::error ::cars.json does not start with [ or {"
+          curl -fsSLo cars_raw.json -H 'Cache-Control: no-cache' --retry 4 --retry-delay 4 "$URL"
+
+          # Basic sanity: must start with { (your /cars returns an object wrapper)
+          if ! head -c 1 cars_raw.json | grep -q '^{'; then
+            echo "::error ::cars_raw.json does not start with {"
+            head -c 500 cars_raw.json || true
+            exit 1
+          fi
+
+          echo "cars_raw.json OK ($(wc -c < cars_raw.json) bytes)"
+
+      - name: Normalize snapshot (extract cars[] + add legacy aliases)
+        run: |
+          set -euo pipefail
+
+          # Build a flat array and add legacy/short keys used by the embeds.
+          # We KEEP all original keys, and add aliases alongside them.
+          jq -c '
+            (.cars // []) 
+            | map(
+                . as $c
+                | $c
+                + {
+                    # legacy aliases your embeds log/use
+                    lat: ($c.latitude // $c.lat),
+                    lng: ($c.longitude // $c.lng),
+                    price: ($c.price_gbp // $c.price),
+                    mileage: ($c.mileage_mi // $c.mileage),
+                    fuel: ($c.fuel_type // $c.fuel),
+                    gearbox: ($c.transmission // $c.gearbox),
+                    bodytype: ($c.body_type // $c.bodytype),
+                    dealer: ($c.dealer_name // $c.dealer),
+                    url: ($c.listing_url // $c.url),
+                    thumb: ($c.image_cover_url // $c.thumb),
+
+                    # NEW->OLD performance/efficiency aliases
+                    owners: ($c.num_owners // $c.owners),
+                    reg: ($c.vehicle_registration_mark // $c.reg),
+                    maxspeed_mph: ($c.performance_maxspeed_mph // $c.maxspeed_mph),
+                    zero_to_60_mph: ($c.performance_acceleration_zero_to_60_mph // $c.zero_to_60_mph),
+                    combined_mpg: ($c.efficiency_combined_mpg // $c.combined_mpg),
+
+                    # keep old shorter names if your UI expects them
+                    engine: ($c.engine_size_l // $c.engine),
+                    power: ($c.power_ps // $c.power),
+                    euro: ($c.euro_standard // $c.euro),
+                    colour: ($c.color // $c.colour)
+                  }
+              )
+          ' cars_raw.json > cars.json
+
+          # Quick sanity: ensure we produced an array and it has at least 1 element
+          if ! head -c 1 cars.json | grep -q '^\['; then
+            echo "::error ::cars.json is not an array after normalization"
             head -c 500 cars.json || true
             exit 1
           fi
 
-          # Required keys (add/remove as you wish)
+          n="$(jq 'length' cars.json)"
+          echo "Normalized cars.json length: $n"
+          if [ "$n" -lt 1 ]; then
+            echo "::error ::cars.json has no cars"
+            exit 1
+          fi
+
+      - name: Required keys sanity (on normalized cars.json)
+        run: |
+          set -euo pipefail
+
+          # Check first item has expected keys (normalized aliases included)
           REQUIRED_KEYS=(
-            '"latitude"'
-            '"longitude"'
-            '"price_gbp"'
-            '"vehicle_registration_mark"'
-            '"performance_maxspeed_mph"'
-            '"performance_acceleration_zero_to_60_mph"'
-            '"efficiency_combined_mpg"'
-            '"images_count"'
-            '"options"'
-            '"features"'
-            '"seller_comments"'
+            "lat"
+            "lng"
+            "price"
+            "thumb"
+            "url"
+            "reg"
+            "maxspeed_mph"
+            "zero_to_60_mph"
+            "combined_mpg"
+            "images_count"
+            "options"
+            "features"
+            "seller_comments"
           )
 
           missing=0
           for k in "${REQUIRED_KEYS[@]}"; do
-            if ! grep -q "$k" cars.json; then
-              echo "::warning ::Missing key in cars.json: $k"
+            if ! jq -e ".[0] | has(\"$k\")" cars.json >/dev/null; then
+              echo "::warning ::Missing key in cars.json[0]: $k"
               missing=$((missing+1))
             fi
           done
 
           if [ "$missing" -gt 0 ]; then
             echo "::error ::cars.json is missing $missing required keys. Aborting so you notice."
-            head -c 1200 cars.json || true
+            jq '.[0]' cars.json || true
             exit 1
           fi
 
