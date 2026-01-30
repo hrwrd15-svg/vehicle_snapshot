@@ -3,7 +3,7 @@ name: Update cars snapshot
 on:
   schedule:
     - cron: '15 5 * * *'   # daily 05:15 UTC
-  workflow_dispatch:        # allow manual runs
+  workflow_dispatch:
 
 jobs:
   update:
@@ -18,16 +18,45 @@ jobs:
           set -euo pipefail
           URL="https://vehicle-api-espm.onrender.com/cars?per_page=25000&page=1&_t=${{ github.run_id }}"
           echo "Downloading: $URL"
-          # nuke any old file to avoid confusion
           rm -f cars.json
-          # pull fresh, retry on cold start
           curl -fsSLo cars.json -H 'Cache-Control: no-cache' --retry 4 --retry-delay 4 "$URL"
-          # sanity check: ensure new fields exist
-          if ! grep -q '"latitude"' cars.json; then
-            echo "::error ::Downloaded cars.json has no latitude field. Aborting so you see this."
-            head -c 1000 cars.json || true
+
+          # Basic sanity: must look like JSON and contain at least one known key
+          if ! head -c 1 cars.json | grep -q '^\[' && ! head -c 1 cars.json | grep -q '^{'; then
+            echo "::error ::cars.json does not start with [ or {"
+            head -c 500 cars.json || true
             exit 1
           fi
+
+          # Required keys (add/remove as you wish)
+          REQUIRED_KEYS=(
+            '"latitude"'
+            '"longitude"'
+            '"price_gbp"'
+            '"vehicle_registration_mark"'
+            '"performance_maxspeed_mph"'
+            '"performance_acceleration_zero_to_60_mph"'
+            '"efficiency_combined_mpg"'
+            '"images_count"'
+            '"options"'
+            '"features"'
+            '"seller_comments"'
+          )
+
+          missing=0
+          for k in "${REQUIRED_KEYS[@]}"; do
+            if ! grep -q "$k" cars.json; then
+              echo "::warning ::Missing key in cars.json: $k"
+              missing=$((missing+1))
+            fi
+          done
+
+          if [ "$missing" -gt 0 ]; then
+            echo "::error ::cars.json is missing $missing required keys. Aborting so you notice."
+            head -c 1200 cars.json || true
+            exit 1
+          fi
+
           echo "cars.json OK ($(wc -c < cars.json) bytes)"
 
       - name: Commit if changed
