@@ -17,7 +17,7 @@ jobs:
       - name: Fetch cars JSON (fresh, with retries)
         run: |
           set -euo pipefail
-          URL="https://vehicle-api-espm.onrender.com/cars?per_page=25000&page=1&_t=${{ github.run_id }}"
+          URL="https://vehicle-api-espm.onrender.com/cars?per_page=250000&page=1&_t=${{ github.run_id }}"
           echo "Downloading: $URL"
           rm -f cars_raw.json cars.json
 
