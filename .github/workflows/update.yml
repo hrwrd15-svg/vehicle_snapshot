@@ -17,11 +17,15 @@ jobs:
       - name: Fetch cars JSON (fresh, with retries)
         run: |
           set -euo pipefail
-          URL="https://vehicle-api-espm.onrender.com/cars?per_page=250000&page=1&_t=${{ github.run_id }}"
+          URL="https://vehicle-api-espm.onrender.com/cars?per_page=150000&page=1&_t=${{ github.run_id }}"
           echo "Downloading: $URL"
           rm -f cars_raw.json cars.json
 
-          curl -fsSLo cars_raw.json -H 'Cache-Control: no-cache' --retry 4 --retry-delay 4 "$URL"
+          curl -sSLo cars_raw.json -H 'Cache-Control: no-cache' --retry 4 --retry-delay 4 --compressed "$URL" || {
+            echo "::error ::curl failed; response (first 2k):"
+            head -c 2000 cars_raw.json || true
+            exit 1
+          }
 
           # Basic sanity: must start with { (your /cars returns an object wrapper)
           if ! head -c 1 cars_raw.json | grep -q '^{'; then
@@ -32,6 +36,13 @@ jobs:
 
           echo "cars_raw.json OK ($(wc -c < cars_raw.json) bytes)"
 
+          # Warn if we're likely truncating (exactly PER_PAGE results means "might be more")
+          count="$(jq '.cars | length' cars_raw.json 2>/dev/null || echo 0)"
+          echo "cars_raw.json cars count: $count"
+          if [ "$count" -eq 150000 ]; then
+            echo "::warning ::Snapshot returned exactly 150000 cars. You may be truncating (need pagination when ready)."
+          fi
+
       - name: Normalize snapshot (extract cars[] + add legacy aliases)
         run: |
           set -euo pipefail
@@ -39,7 +50,7 @@ jobs:
           # Build a flat array and add legacy/short keys used by the embeds.
           # We KEEP all original keys, and add aliases alongside them.
           jq -c '
-            (.cars // []) 
+            (.cars // [])
             | map(
                 . as $c
                 | $c
@@ -56,21 +67,25 @@ jobs:
                     url: ($c.listing_url // $c.url),
                     thumb: ($c.image_cover_url // $c.thumb),
 
-                    # NEW->OLD performance/efficiency aliases
                     owners: ($c.num_owners // $c.owners),
                     reg: ($c.vehicle_registration_mark // $c.reg),
                     maxspeed_mph: ($c.performance_maxspeed_mph // $c.maxspeed_mph),
                     zero_to_60_mph: ($c.performance_acceleration_zero_to_60_mph // $c.zero_to_60_mph),
                     combined_mpg: ($c.efficiency_combined_mpg // $c.combined_mpg),
 
-                    # keep old shorter names if your UI expects them
                     engine: ($c.engine_size_l // $c.engine),
                     power: ($c.power_ps // $c.power),
                     euro: ($c.euro_standard // $c.euro),
-                    colour: ($c.color // $c.colour)
+                    colour: ($c.color // $c.colour),
+
+                    # HARD DEFAULTS so keys always exist (prevents random workflow aborts)
+                    images_count: ($c.images_count // 0),
+                    options: ($c.options // []),
+                    features: ($c.features // []),
+                    seller_comments: ($c.seller_comments // "")
                   }
-              )
-          ' cars_raw.json > cars.json
+             )
+             ' cars_raw.json > cars.json
 
           # Quick sanity: ensure we produced an array and it has at least 1 element
           if ! head -c 1 cars.json | grep -q '^\['; then
