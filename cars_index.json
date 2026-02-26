@@ -1,0 +1,10 @@
+{
+  "generated_at": "2026-02-26T10:25:57Z",
+  "total_cars": 168167,
+  "chunks": 3,
+  "files": [
+    "cars_0001.json",
+    "cars_0002.json",
+    "cars_0003.json"
+  ]
+}
