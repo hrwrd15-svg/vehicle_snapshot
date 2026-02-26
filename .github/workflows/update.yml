@@ -14,41 +14,87 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch cars JSON (fresh, with retries)
+      - name: Fetch cars JSON (paged, robust, with retries)
         run: |
           set -euo pipefail
-          URL="https://vehicle-api-espm.onrender.com/cars?per_page=150000&page=1&_t=${{ github.run_id }}"
-          echo "Downloading: $URL"
-          rm -f cars_raw.json cars.json
 
-          curl -sSLo cars_raw.json -H 'Cache-Control: no-cache' --retry 4 --retry-delay 4 --compressed "$URL" || {
-            echo "::error ::curl failed; response (first 2k):"
-            head -c 2000 cars_raw.json || true
-            exit 1
-          }
+          BASE="https://vehicle-api-espm.onrender.com/cars"
+          PER_PAGE=100000   # safer than 150k; will fetch page 1 + 2 for ~160k cars
+          MAX_PAGES=10
+          T="${{ github.run_id }}"
 
-          # Basic sanity: must start with { (your /cars returns an object wrapper)
-          if ! head -c 1 cars_raw.json | grep -q '^{'; then
-            echo "::error ::cars_raw.json does not start with {"
-            head -c 500 cars_raw.json || true
-            exit 1
-          fi
+          rm -f cars_raw.json cars.json page_*.json
 
+          echo '{"cars":[]}' > cars_raw.json
+
+          page=1
+          while [ "$page" -le "$MAX_PAGES" ]; do
+            URL="${BASE}?per_page=${PER_PAGE}&page=${page}&_t=${T}"
+            OUT="page_${page}.json"
+            echo "Downloading page ${page}: $URL"
+
+            # Fetch and capture HTTP status code
+            http_code="$(
+              curl -sSLo "$OUT" \
+                -H 'Cache-Control: no-cache' \
+                -H 'Accept: application/json' \
+                --compressed \
+                --retry 6 --retry-delay 4 --retry-all-errors \
+                -w "%{http_code}" \
+                "$URL" || true
+            )"
+
+            if [ "$http_code" != "200" ]; then
+              echo "::error ::HTTP $http_code from API for page ${page}"
+              echo "::error ::Response (first 2000 chars):"
+              head -c 2000 "$OUT" || true
+              exit 1
+            fi
+
+            # Validate JSON (don’t assume first char)
+            if ! jq -e '.' "$OUT" >/dev/null 2>&1; then
+              echo "::error ::Page ${page} is not valid JSON"
+              echo "::error ::Response (first 2000 chars):"
+              head -c 2000 "$OUT" || true
+              exit 1
+            fi
+
+            # Validate expected wrapper + get count
+            if ! jq -e 'has("cars") and (.cars | type=="array")' "$OUT" >/dev/null; then
+              echo "::error ::Page ${page} JSON does not have expected { cars: [] } wrapper"
+              echo "::error ::Top-level keys:"
+              jq -r 'keys | join(", ")' "$OUT" || true
+              exit 1
+            fi
+
+            count="$(jq '.cars | length' "$OUT")"
+            echo "Page ${page} cars: ${count}"
+
+            # Merge into cars_raw.json wrapper
+            jq -s '.[0].cars += .[1].cars | .[0]' cars_raw.json "$OUT" > cars_raw_merged.json
+            mv cars_raw_merged.json cars_raw.json
+
+            # Stop if this page was short (means last page)
+            if [ "$count" -lt "$PER_PAGE" ]; then
+              break
+            fi
+
+            page=$((page+1))
+          done
+
+          total="$(jq '.cars | length' cars_raw.json)"
+          echo "cars_raw.json total cars: $total"
           echo "cars_raw.json OK ($(wc -c < cars_raw.json) bytes)"
 
-          # Warn if we're likely truncating (exactly PER_PAGE results means "might be more")
-          count="$(jq '.cars | length' cars_raw.json 2>/dev/null || echo 0)"
-          echo "cars_raw.json cars count: $count"
-          if [ "$count" -eq 150000 ]; then
-            echo "::warning ::Snapshot returned exactly 150000 cars. You may be truncating (need pagination when ready)."
+          if [ "$total" -lt 1 ]; then
+            echo "::error ::cars_raw.json has no cars"
+            exit 1
           fi
 
-      - name: Normalize snapshot (extract cars[] + add legacy aliases)
+      - name: Normalize snapshot (extract cars[] + add legacy aliases + defaults)
         run: |
           set -euo pipefail
 
-          # Build a flat array and add legacy/short keys used by the embeds.
-          # We KEEP all original keys, and add aliases alongside them.
           jq -c '
             (.cars // [])
             | map(
@@ -67,76 +113,65 @@ jobs:
                     url: ($c.listing_url // $c.url),
                     thumb: ($c.image_cover_url // $c.thumb),
 
+                    # performance/efficiency aliases
                     owners: ($c.num_owners // $c.owners),
                     reg: ($c.vehicle_registration_mark // $c.reg),
                     maxspeed_mph: ($c.performance_maxspeed_mph // $c.maxspeed_mph),
                     zero_to_60_mph: ($c.performance_acceleration_zero_to_60_mph // $c.zero_to_60_mph),
                     combined_mpg: ($c.efficiency_combined_mpg // $c.combined_mpg),
 
+                    # shorter names if UI expects them
                     engine: ($c.engine_size_l // $c.engine),
                     power: ($c.power_ps // $c.power),
                     euro: ($c.euro_standard // $c.euro),
                     colour: ($c.color // $c.colour),
 
-                    # HARD DEFAULTS so keys always exist (prevents random workflow aborts)
+                    # HARD DEFAULTS so keys always exist (prevents random aborts)
                     images_count: ($c.images_count // 0),
                     options: ($c.options // []),
                     features: ($c.features // []),
                     seller_comments: ($c.seller_comments // "")
                   }
-             )
-             ' cars_raw.json > cars.json
+              )
+          ' cars_raw.json > cars.json
 
           # Quick sanity: ensure we produced an array and it has at least 1 element
-          if ! head -c 1 cars.json | grep -q '^\['; then
-            echo "::error ::cars.json is not an array after normalization"
+          if ! jq -e 'type=="array" and length>0' cars.json >/dev/null; then
+            echo "::error ::cars.json is not a non-empty array after normalization"
             head -c 500 cars.json || true
             exit 1
           fi
 
           n="$(jq 'length' cars.json)"
           echo "Normalized cars.json length: $n"
-          if [ "$n" -lt 1 ]; then
-            echo "::error ::cars.json has no cars"
-            exit 1
-          fi
+          echo "cars.json OK ($(wc -c < cars.json) bytes)"
 
-      - name: Required keys sanity (on normalized cars.json)
+      - name: Required keys sanity (sample first 20 cars)
         run: |
           set -euo pipefail
 
-          # Check first item has expected keys (normalized aliases included)
           REQUIRED_KEYS=(
-            "lat"
-            "lng"
-            "price"
-            "thumb"
-            "url"
-            "reg"
-            "maxspeed_mph"
-            "zero_to_60_mph"
-            "combined_mpg"
-            "images_count"
-            "options"
-            "features"
-            "seller_comments"
+            "lat" "lng" "price" "thumb" "url" "reg"
+            "maxspeed_mph" "zero_to_60_mph" "combined_mpg"
+            "images_count" "options" "features" "seller_comments"
           )
 
           missing=0
           for k in "${REQUIRED_KEYS[@]}"; do
-            if ! jq -e ".[0] | has(\"$k\")" cars.json >/dev/null; then
-              echo "::warning ::Missing key in cars.json[0]: $k"
+            if ! jq -e ".[0:20] | all(has(\"$k\"))" cars.json >/dev/null; then
+              echo "::warning ::Some of the first 20 cars are missing key: $k"
               missing=$((missing+1))
             fi
           done
 
           if [ "$missing" -gt 0 ]; then
-            echo "::error ::cars.json is missing $missing required keys. Aborting so you notice."
+            echo "::error ::cars.json missing $missing required keys (in first 20). Aborting."
+            echo "::error ::Example first car:"
             jq '.[0]' cars.json || true
             exit 1
           fi
 
-          echo "cars.json OK ($(wc -c < cars.json) bytes)"
+          echo "cars.json required-keys sanity OK"
 
       - name: Commit if changed
         uses: stefanzweifel/git-auto-commit-action@v5
