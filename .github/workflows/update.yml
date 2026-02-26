@@ -1,4 +1,4 @@
-name: Update cars snapshot
+name: Update cars snapshot (chunked)
 
 on:
   schedule:
@@ -19,11 +19,11 @@ jobs:
           set -euo pipefail
 
           BASE="https://vehicle-api-espm.onrender.com/cars"
-          PER_PAGE=20000        # safe for 512MB Render
-          MAX_PAGES=30          # 20k * 30 = 600k cap
+          PER_PAGE=20000
+          MAX_PAGES=40
           T="${{ github.run_id }}"
 
-          rm -f cars_raw.json cars.json page_*.json
+          rm -f cars_raw.json cars.json page_*.json cars_*.json cars_index.json
 
           echo '{"cars":[]}' > cars_raw.json
 
@@ -49,7 +49,6 @@ jobs:
                 return 0
               fi
 
-              # Transient gateway/service errors: back off and retry
               if [ "$code" = "503" ] || [ "$code" = "502" ] || [ "$code" = "504" ]; then
                 echo "::warning ::HTTP $code (attempt $attempt/8). Backing off..."
                 case "$attempt" in
@@ -66,7 +65,6 @@ jobs:
                 continue
               fi
 
-              # Non-transient: fail and show body preview
               echo "::error ::HTTP $code from API"
               echo "::error ::Response (first 2000 chars):"
               head -c 2000 "$out" || true
@@ -87,18 +85,14 @@ jobs:
 
             fetch_page "$URL" "$OUT"
 
-            # Validate JSON (don’t assume first char)
             if ! jq -e '.' "$OUT" >/dev/null 2>&1; then
               echo "::error ::Page ${page} is not valid JSON"
-              echo "::error ::Response (first 2000 chars):"
               head -c 2000 "$OUT" || true
               exit 1
             fi
 
-            # Validate wrapper
             if ! jq -e 'has("cars") and (.cars | type=="array")' "$OUT" >/dev/null; then
-              echo "::error ::Page ${page} JSON does not have expected { cars: [] } wrapper"
-              echo "::error ::Top-level keys:"
+              echo "::error ::Page ${page} missing { cars: [] } wrapper"
               jq -r 'keys | join(", ")' "$OUT" || true
               exit 1
             fi
@@ -106,14 +100,11 @@ jobs:
             count="$(jq '.cars | length' "$OUT")"
             echo "Page ${page} cars: ${count}"
 
-            # Merge into cars_raw.json wrapper
             jq -s '.[0].cars += .[1].cars | .[0]' cars_raw.json "$OUT" > cars_raw_merged.json
             mv cars_raw_merged.json cars_raw.json
 
-            # Be nice to the API between pages
             sleep 2
 
-            # Stop at last page
             if [ "$count" -lt "$PER_PAGE" ]; then
               break
             fi
@@ -123,14 +114,12 @@ jobs:
 
           total="$(jq '.cars | length' cars_raw.json)"
           echo "cars_raw.json total cars: $total"
-          echo "cars_raw.json OK ($(wc -c < cars_raw.json) bytes)"
-
           if [ "$total" -lt 1 ]; then
-            echo "::error ::cars_raw.json has no cars"
+            echo "::error ::No cars returned"
             exit 1
           fi
 
-      - name: Normalize snapshot (extract cars[] + add legacy aliases + defaults)
+      - name: Normalize snapshot (array + legacy aliases + defaults)
         run: |
           set -euo pipefail
 
@@ -140,7 +129,6 @@ jobs:
                 . as $c
                 | $c
                 + {
-                    # legacy aliases your embeds log/use
                     lat: ($c.latitude // $c.lat),
                     lng: ($c.longitude // $c.lng),
                     price: ($c.price_gbp // $c.price),
@@ -152,20 +140,17 @@ jobs:
                     url: ($c.listing_url // $c.url),
                     thumb: ($c.image_cover_url // $c.thumb),
 
-                    # performance/efficiency aliases
                     owners: ($c.num_owners // $c.owners),
                     reg: ($c.vehicle_registration_mark // $c.reg),
                     maxspeed_mph: ($c.performance_maxspeed_mph // $c.maxspeed_mph),
                     zero_to_60_mph: ($c.performance_acceleration_zero_to_60_mph // $c.zero_to_60_mph),
                     combined_mpg: ($c.efficiency_combined_mpg // $c.combined_mpg),
 
-                    # shorter names if UI expects them
                     engine: ($c.engine_size_l // $c.engine),
                     power: ($c.power_ps // $c.power),
                     euro: ($c.euro_standard // $c.euro),
                     colour: ($c.color // $c.colour),
 
-                    # defaults so keys always exist (keeps your sanity check stable)
                     images_count: ($c.images_count // 0),
                     options: ($c.options // []),
                     features: ($c.features // []),
@@ -174,46 +159,84 @@ jobs:
               )
           ' cars_raw.json > cars.json
 
-          # Quick sanity: ensure we produced an array and it has at least 1 element
-          if ! jq -e 'type=="array" and length>0' cars.json >/dev/null; then
-            echo "::error ::cars.json is not a non-empty array after normalization"
-            head -c 500 cars.json || true
-            exit 1
-          fi
-
           n="$(jq 'length' cars.json)"
           echo "Normalized cars.json length: $n"
-          echo "cars.json OK ($(wc -c < cars.json) bytes)"
+          echo "cars.json size: $(wc -c < cars.json) bytes"
 
-      - name: Required keys sanity (sample first 50 cars)
+      - name: Chunk cars.json into <95MB files + write index
         run: |
           set -euo pipefail
 
-          REQUIRED_KEYS=(
-            "lat" "lng" "price" "thumb" "url" "reg"
-            "maxspeed_mph" "zero_to_60_mph" "combined_mpg"
-            "images_count" "options" "features" "seller_comments"
-          )
+          # Target max chunk size (bytes). Keep margin under 100MB hard limit.
+          MAX_BYTES=$((95 * 1024 * 1024))
 
-          missing=0
-          for k in "${REQUIRED_KEYS[@]}"; do
-            if ! jq -e ".[0:50] | all(has(\"$k\"))" cars.json >/dev/null; then
-              echo "::warning ::Some of the first 50 cars are missing key: $k"
-              missing=$((missing+1))
+          rm -f cars_*.json cars_index.json
+
+          # Stream items and build chunks by approximate size
+          idx=1
+          bytes=2   # "[]"
+          echo "[" > "cars_$(printf '%04d' $idx).json"
+
+          # Iterate each compact item
+          jq -c '.[]' cars.json | while IFS= read -r line; do
+            # +1 for comma/newline
+            lbytes=$(printf '%s' "$line" | wc -c | tr -d ' ')
+            add=$((lbytes + 2))
+
+            if [ "$bytes" -gt 2 ] && [ $((bytes + add)) -gt "$MAX_BYTES" ]; then
+              # close current chunk
+              echo "]" >> "cars_$(printf '%04d' $idx).json"
+              idx=$((idx+1))
+              bytes=2
+              echo "[" > "cars_$(printf '%04d' $idx).json"
             fi
+
+            if [ "$bytes" -gt 2 ]; then
+              echo "," >> "cars_$(printf '%04d' $idx).json"
+              bytes=$((bytes+1))
+            fi
+
+            printf '%s' "$line" >> "cars_$(printf '%04d' $idx).json"
+            bytes=$((bytes + lbytes))
           done
 
-          if [ "$missing" -gt 0 ]; then
-            echo "::error ::cars.json missing $missing required keys (in first 50). Aborting."
-            echo "::error ::Example first car:"
-            jq '.[0]' cars.json || true
+          # close last chunk
+          echo "]" >> "cars_$(printf '%04d' $idx).json"
+
+          # build index
+          files=$(ls -1 cars_*.json | sort | jq -R -s -c 'split("\n")[:-1]')
+          total=$(jq 'length' cars.json)
+          chunks=$(ls -1 cars_*.json | wc -l | tr -d ' ')
+          ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          jq -n \
+            --argjson files "$files" \
+            --argjson total "$total" \
+            --argjson chunks "$chunks" \
+            --arg ts "$ts" \
+            '{generated_at:$ts,total_cars:$total,chunks:$chunks,files:$files}' \
+            > cars_index.json
+
+          echo "Wrote $chunks chunk files."
+          ls -lh cars_*.json cars_index.json || true
+
+          # Safety: fail if any chunk exceeds 99MB
+          too_big=$(find . -maxdepth 1 -name 'cars_*.json' -size +99M | wc -l | tr -d ' ')
+          if [ "$too_big" != "0" ]; then
+            echo "::error ::One or more chunk files exceeded 99MB. Adjust MAX_BYTES lower."
+            find . -maxdepth 1 -name 'cars_*.json' -size +99M -print -exec ls -lh {} \;
             exit 1
           fi
 
-          echo "cars.json required-keys sanity OK"
+      - name: Remove monolithic cars.json (avoid push rejection)
+        run: |
+          set -euo pipefail
+          rm -f cars.json cars_raw.json page_*.json || true
 
       - name: Commit if changed
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Daily snapshot"
-          file_pattern: cars.json
+          commit_message: "Daily snapshot (chunked)"
+          file_pattern: |
+            cars_index.json
+            cars_*.json
