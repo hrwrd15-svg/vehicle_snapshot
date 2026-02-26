@@ -14,42 +14,78 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch cars JSON (paged, robust, with retries)
+      - name: Fetch cars JSON (paged + lite + no-meta + backoff)
         run: |
           set -euo pipefail
 
           BASE="https://vehicle-api-espm.onrender.com/cars"
-          PER_PAGE=100000   # safer than 150k; will fetch page 1 + 2 for ~160k cars
-          MAX_PAGES=10
+          PER_PAGE=20000        # safe for 512MB Render
+          MAX_PAGES=30          # 20k * 30 = 600k cap
           T="${{ github.run_id }}"
 
           rm -f cars_raw.json cars.json page_*.json
 
           echo '{"cars":[]}' > cars_raw.json
 
+          fetch_page () {
+            local url="$1"
+            local out="$2"
+
+            local attempt=1
+            while [ "$attempt" -le 8 ]; do
+              local code
+              code="$(
+                curl -sSLo "$out" \
+                  -H 'Cache-Control: no-cache' \
+                  -H 'Accept: application/json' \
+                  --compressed \
+                  --connect-timeout 20 \
+                  --max-time 240 \
+                  -w "%{http_code}" \
+                  "$url" || true
+              )"
+
+              if [ "$code" = "200" ]; then
+                return 0
+              fi
+
+              # Transient gateway/service errors: back off and retry
+              if [ "$code" = "503" ] || [ "$code" = "502" ] || [ "$code" = "504" ]; then
+                echo "::warning ::HTTP $code (attempt $attempt/8). Backing off..."
+                case "$attempt" in
+                  1) sleep 5 ;;
+                  2) sleep 10 ;;
+                  3) sleep 20 ;;
+                  4) sleep 30 ;;
+                  5) sleep 45 ;;
+                  6) sleep 60 ;;
+                  7) sleep 90 ;;
+                  8) sleep 120 ;;
+                esac
+                attempt=$((attempt+1))
+                continue
+              fi
+
+              # Non-transient: fail and show body preview
+              echo "::error ::HTTP $code from API"
+              echo "::error ::Response (first 2000 chars):"
+              head -c 2000 "$out" || true
+              return 1
+            done
+
+            echo "::error ::API kept returning 502/503/504 after multiple retries."
+            echo "::error ::Last response (first 2000 chars):"
+            head -c 2000 "$out" || true
+            return 1
+          }
+
           page=1
           while [ "$page" -le "$MAX_PAGES" ]; do
-            URL="${BASE}?per_page=${PER_PAGE}&page=${page}&_t=${T}"
+            URL="${BASE}?lite=1&include_meta=0&per_page=${PER_PAGE}&page=${page}&_t=${T}"
             OUT="page_${page}.json"
             echo "Downloading page ${page}: $URL"
 
-            # Fetch and capture HTTP status code
-            http_code="$(
-              curl -sSLo "$OUT" \
-                -H 'Cache-Control: no-cache' \
-                -H 'Accept: application/json' \
-                --compressed \
-                --retry 6 --retry-delay 4 --retry-all-errors \
-                -w "%{http_code}" \
-                "$URL" || true
-            )"
-
-            if [ "$http_code" != "200" ]; then
-              echo "::error ::HTTP $http_code from API for page ${page}"
-              echo "::error ::Response (first 2000 chars):"
-              head -c 2000 "$OUT" || true
-              exit 1
-            fi
+            fetch_page "$URL" "$OUT"
 
             # Validate JSON (don’t assume first char)
             if ! jq -e '.' "$OUT" >/dev/null 2>&1; then
@@ -59,7 +95,7 @@ jobs:
               exit 1
             fi
 
-            # Validate expected wrapper + get count
+            # Validate wrapper
             if ! jq -e 'has("cars") and (.cars | type=="array")' "$OUT" >/dev/null; then
               echo "::error ::Page ${page} JSON does not have expected { cars: [] } wrapper"
               echo "::error ::Top-level keys:"
@@ -74,7 +110,10 @@ jobs:
             jq -s '.[0].cars += .[1].cars | .[0]' cars_raw.json "$OUT" > cars_raw_merged.json
             mv cars_raw_merged.json cars_raw.json
 
-            # Stop if this page was short (means last page)
+            # Be nice to the API between pages
+            sleep 2
+
+            # Stop at last page
             if [ "$count" -lt "$PER_PAGE" ]; then
               break
             fi
@@ -126,7 +165,7 @@ jobs:
                     euro: ($c.euro_standard // $c.euro),
                     colour: ($c.color // $c.colour),
 
-                    # HARD DEFAULTS so keys always exist (prevents random aborts)
+                    # defaults so keys always exist (keeps your sanity check stable)
                     images_count: ($c.images_count // 0),
                     options: ($c.options // []),
                     features: ($c.features // []),
@@ -146,7 +185,7 @@ jobs:
           echo "Normalized cars.json length: $n"
           echo "cars.json OK ($(wc -c < cars.json) bytes)"
 
-      - name: Required keys sanity (sample first 20 cars)
+      - name: Required keys sanity (sample first 50 cars)
         run: |
           set -euo pipefail
 
@@ -158,14 +197,14 @@ jobs:
 
           missing=0
           for k in "${REQUIRED_KEYS[@]}"; do
-            if ! jq -e ".[0:20] | all(has(\"$k\"))" cars.json >/dev/null; then
-              echo "::warning ::Some of the first 20 cars are missing key: $k"
+            if ! jq -e ".[0:50] | all(has(\"$k\"))" cars.json >/dev/null; then
+              echo "::warning ::Some of the first 50 cars are missing key: $k"
               missing=$((missing+1))
             fi
           done
 
           if [ "$missing" -gt 0 ]; then
-            echo "::error ::cars.json missing $missing required keys (in first 20). Aborting."
+            echo "::error ::cars.json missing $missing required keys (in first 50). Aborting."
             echo "::error ::Example first car:"
             jq '.[0]' cars.json || true
             exit 1
