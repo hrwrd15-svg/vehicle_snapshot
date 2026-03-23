@@ -111,6 +111,9 @@ jobs:
 
                       engine: ($c.engine_size_l // $c.engine),
                       power: ($c.power_ps // $c.power),
+                      doors: ($c.doors // null),
+                      drivetrain: ($c.drivetrain // null),
+                      euro_standard: ($c.euro_standard // null),
                       euro: ($c.euro_standard // $c.euro),
                       colour: ($c.color // $c.colour),
 
