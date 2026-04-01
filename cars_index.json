@@ -1,7 +1,7 @@
 {
-  "generated_at": "2026-03-31T06:50:01Z",
-  "total_cars": 185680,
-  "chunks": 10,
+  "generated_at": "2026-04-01T06:59:54Z",
+  "total_cars": 175850,
+  "chunks": 9,
   "files": [
     "cars_0001.json",
     "cars_0002.json",
@@ -11,7 +11,6 @@
     "cars_0006.json",
     "cars_0007.json",
     "cars_0008.json",
-    "cars_0009.json",
-    "cars_0010.json"
+    "cars_0009.json"
   ]
 }
